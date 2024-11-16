@@ -1,7 +1,14 @@
 package com.hjc.houapigateway;
 
+import com.hjc.hjccommon.model.entity.InterfaceInfo;
+import com.hjc.hjccommon.model.entity.User;
+import com.hjc.hjccommon.service.InnerInterfaceInfoService;
+import com.hjc.hjccommon.service.InnerUserInterfaceInfoService;
+import com.hjc.hjccommon.service.InnerUserService;
 import com.hjc.hjjcclientsdk.util.SignUtils;
 import lombok.extern.slf4j.Slf4j;
+import lombok.val;
+import org.apache.dubbo.config.annotation.DubboReference;
 import org.reactivestreams.Publisher;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
@@ -36,7 +43,19 @@ import java.util.concurrent.atomic.AtomicReference;
 @Component
 public class CustomGlobalFilter implements GlobalFilter, Ordered {
 
+    @DubboReference
+    private InnerUserService  innerUserService;
+
+    @DubboReference
+    private InnerInterfaceInfoService innerInterfaceInfoService;
+
+    @DubboReference
+    private InnerUserInterfaceInfoService innerUserInterfaceInfoService;
+
+
+
     private static final List<String> IP_WHITE_LIST = Arrays.asList("127.0.0.1");
+    private static final String INTERFACE_HOST = "http://localhost:8123";
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
         //1.用户发送请求到 API 网关
@@ -64,9 +83,14 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
         String body = headers.getFirst("body");
 
 // todo 实际情况应该是去数据库中查是否已分配给用户
-        if (!"5f3fcad2098c9adfbd74cd2f6e24250f".equals(accessKey)){
+        User invokeUser = null;
+        try {
+            invokeUser = innerUserService.getInvokeUser(accessKey);
+        }catch (Exception e){
+        log.error("getInvokeUser  ERROE",e);
+        }
+        if (invokeUser == null ||!invokeUser.getAccessKey().equals(accessKey)){
             return handleNoAuth(response);
-
         }
 // 直接校验如果随机数大于1万，则抛出异常，并提示"无权限"
         if (Long.parseLong(nonce) > 10000) {
@@ -81,17 +105,37 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
 
 
 // todo 实际情况中是从数据库中查出 secretKey
-        String serverSign = SignUtils.getSion(body, "6131b2e69fdf5f5715ed7a43461a6727");
+        String serverSign = SignUtils.getSion(body, invokeUser.getSecretKey());
 // 如果生成的签名不一致，则抛出异常，并提示"无权限"
         if (!sign.equals(serverSign)) {
             return handleNoAuth(response);
         }
+
+
+        InterfaceInfo interfaceInfo = null;
+        try {
+            String path =   request.getPath().value();
+            String method = request.getMethod().toString();
+            interfaceInfo = innerInterfaceInfoService.getInterfaceInfo(path, method);
+
+        }catch (Exception e){
+            log.error("getInterfaceInfo  ERROE",e);
+        }
+        //接口不存在
+        if(interfaceInfo == null){
+            return handleNoAuth(response);//
+        }else{
+            interfaceInfo.setUrl( INTERFACE_HOST + request.getPath().value());
+        }
+
+
 // todo 调用次数 + 1
+
 
 //        return handleNoAuth(response);
         //5.请求的模拟接口是杏存在?
         //6.请求转发，调用模拟接口
-        return handleResponse(exchange, chain);
+        return handleResponse(exchange, chain,interfaceInfo.getId(),invokeUser.getId());
 
 
 
@@ -134,7 +178,7 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
      * @param chain
      * @return
      */
-    public Mono<Void> handleResponse(ServerWebExchange exchange, GatewayFilterChain chain) {
+    public Mono<Void> handleResponse(ServerWebExchange exchange, GatewayFilterChain chain,long interfaceInfoId,long uerId) {
         try {
             // 获取原始的响应对象
             ServerHttpResponse originalResponse = exchange.getResponse();
@@ -162,6 +206,11 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
                             // (这里就理解为它在拼接字符串,它把缓冲区的数据取出来，一点一点拼接好)
                             //8.调用成功，接口调用次数+1
                             if(originalResponse.getStatusCode() == HttpStatus.OK){  //调用过程中无异常
+                                try {
+                                    innerUserInterfaceInfoService.invokeCount(interfaceInfoId,uerId);
+                                }catch (Exception e){
+                                    log.error("invokeCount  ERROE",e);
+                                }
 
                                 System.out.println("调用成功，接口调用次数+1");
                             }else{
